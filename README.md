@@ -4,8 +4,9 @@ A small Go CLI for checking Codex usage across multiple isolated accounts.
 
 ## Final UX
 
-The tool is intentionally simple:
+The tool now has two modes:
 
+- `codex-usage` => lightweight dashboard
 - `codex-usage add <email>`
 - `codex-usage list`
 
@@ -14,6 +15,24 @@ Each email becomes its own isolated profile under:
 ```text
 ~/.codex-multi/profiles/<email>/.codex
 ```
+
+## Dashboard mode
+
+Run without arguments:
+
+```bash
+codex-usage
+```
+
+Dashboard behavior:
+- shows all email profiles in a terminal table
+- refreshes automatically every 1 hour
+- supports simple commands typed then Enter:
+  - `r` => refresh now
+  - `a` => show add-account hint
+  - `q` => quit
+
+This is a lightweight dashboard, not a full Bubble Tea app yet.
 
 ## Commands
 

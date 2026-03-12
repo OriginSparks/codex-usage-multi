@@ -1,6 +1,7 @@
 package app
 
 import (
+	"bufio"
 	"errors"
 	"fmt"
 	"io"
@@ -9,6 +10,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 	"text/tabwriter"
 	"time"
 
@@ -19,10 +21,11 @@ import (
 
 var emailPattern = regexp.MustCompile(`^[^\s@]+@[^\s@]+\.[^\s@]+$`)
 
+const defaultRefreshInterval = time.Hour
+
 func Run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 	if len(args) == 0 {
-		writeHelp(stdout)
-		return nil
+		return runDashboard(stdin, stdout)
 	}
 
 	switch args[0] {
@@ -71,9 +74,97 @@ func runAdd(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 }
 
 func runList(stdout io.Writer) error {
-	names, err := profiles.List()
+	rows, err := fetchRows()
 	if err != nil {
 		return err
+	}
+	return printRows(stdout, rows)
+}
+
+func runDashboard(stdin io.Reader, stdout io.Writer) error {
+	commands := make(chan string, 4)
+	go readDashboardCommands(stdin, commands)
+
+	rows, err := fetchRows()
+	message := ""
+	if err != nil {
+		message = err.Error()
+	}
+	renderDashboard(stdout, rows, message)
+
+	ticker := time.NewTicker(defaultRefreshInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case cmd, ok := <-commands:
+			if !ok {
+				return nil
+			}
+			switch cmd {
+			case "q", "quit", "exit":
+				return nil
+			case "r", "refresh", "":
+				rows, err = fetchRows()
+				if err != nil {
+					message = err.Error()
+				} else {
+					message = "refreshed"
+				}
+				renderDashboard(stdout, rows, message)
+			case "a", "add":
+				message = "use: codex-usage add <email>"
+				renderDashboard(stdout, rows, message)
+			default:
+				message = fmt.Sprintf("unknown command: %s", cmd)
+				renderDashboard(stdout, rows, message)
+			}
+		case <-ticker.C:
+			rows, err = fetchRows()
+			if err != nil {
+				message = err.Error()
+			} else {
+				message = "auto-refreshed"
+			}
+			renderDashboard(stdout, rows, message)
+		}
+	}
+}
+
+func readDashboardCommands(stdin io.Reader, commands chan<- string) {
+	defer close(commands)
+	scanner := bufio.NewScanner(stdin)
+	for scanner.Scan() {
+		commands <- strings.TrimSpace(strings.ToLower(scanner.Text()))
+	}
+}
+
+func renderDashboard(stdout io.Writer, rows []listRow, message string) {
+	_, _ = fmt.Fprint(stdout, "\033[2J\033[H")
+	_, _ = fmt.Fprintf(stdout, "codex-usage dashboard%52s\n\n", "updated "+time.Now().Format("15:04"))
+	_ = printRows(stdout, rows)
+	_, _ = fmt.Fprintln(stdout)
+	_, _ = fmt.Fprintln(stdout, "Commands: r refresh | a add hint | q quit")
+	_, _ = fmt.Fprintf(stdout, "Refresh interval: %s\n", defaultRefreshInterval)
+	if message != "" {
+		_, _ = fmt.Fprintf(stdout, "Status: %s\n", message)
+	}
+	_, _ = fmt.Fprintln(stdout, "Type a command then press Enter.")
+}
+
+func printRows(stdout io.Writer, rows []listRow) error {
+	tw := tabwriter.NewWriter(stdout, 0, 4, 2, ' ', 0)
+	fmt.Fprintln(tw, "PROFILE\t5H LEFT\t5H RESET\t1W LEFT\t1W RESET\tSTATUS")
+	for _, row := range rows {
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n", row.Profile, row.FiveHourLeft, row.FiveHourReset, row.WeekLeft, row.WeekReset, row.Status)
+	}
+	return tw.Flush()
+}
+
+func fetchRows() ([]listRow, error) {
+	names, err := profiles.List()
+	if err != nil {
+		return nil, err
 	}
 	filtered := make([]string, 0, len(names))
 	for _, name := range names {
@@ -82,18 +173,26 @@ func runList(stdout io.Writer) error {
 		}
 	}
 	sort.Strings(filtered)
-
-	tw := tabwriter.NewWriter(stdout, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(tw, "PROFILE\t5H LEFT\t5H RESET\t1W LEFT\t1W RESET")
-	for _, name := range filtered {
-		row, err := buildListRow(name)
-		if err != nil {
-			fmt.Fprintf(tw, "%s\tERR\t-\tERR\t%s\n", name, compactError(err))
-			continue
-		}
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n", row.Profile, row.FiveHourLeft, row.FiveHourReset, row.WeekLeft, row.WeekReset)
+	if len(filtered) == 0 {
+		return []listRow{}, nil
 	}
-	return tw.Flush()
+
+	results := make([]listRow, len(filtered))
+	var wg sync.WaitGroup
+	for i, name := range filtered {
+		wg.Add(1)
+		go func(idx int, profile string) {
+			defer wg.Done()
+			row, err := buildListRow(profile)
+			if err != nil {
+				results[idx] = listRow{Profile: profile, FiveHourLeft: "ERR", FiveHourReset: "-", WeekLeft: "ERR", WeekReset: "-", Status: compactError(err)}
+				return
+			}
+			results[idx] = row
+		}(i, name)
+	}
+	wg.Wait()
+	return results, nil
 }
 
 func buildListRow(name string) (listRow, error) {
@@ -108,14 +207,14 @@ func buildListRow(name string) (listRow, error) {
 	}
 	_ = profiles.MarkChecked(name)
 
-	row := listRow{Profile: name, FiveHourLeft: "-", FiveHourReset: "-", WeekLeft: "-", WeekReset: "-"}
+	row := listRow{Profile: name, FiveHourLeft: "-", FiveHourReset: "-", WeekLeft: "-", WeekReset: "-", Status: "ok"}
 	for _, window := range snapshot.Windows {
 		switch window.Label {
 		case "5h":
-			row.FiveHourLeft = fmt.Sprintf("%d%%", 100-window.UsedPercent)
+			row.FiveHourLeft = fmt.Sprintf("%d%%", max(0, 100-window.UsedPercent))
 			row.FiveHourReset = formatReset(window.ResetAt)
 		case "1w":
-			row.WeekLeft = fmt.Sprintf("%d%%", 100-window.UsedPercent)
+			row.WeekLeft = fmt.Sprintf("%d%%", max(0, 100-window.UsedPercent))
 			row.WeekReset = formatReset(window.ResetAt)
 		}
 	}
@@ -167,6 +266,7 @@ type listRow struct {
 	FiveHourReset string
 	WeekLeft      string
 	WeekReset     string
+	Status        string
 }
 
 func formatReset(value string) string {
@@ -207,5 +307,7 @@ codex-usage manages isolated Codex accounts by email.
 Commands:
   add <email>
   list
+
+No arguments starts the lightweight dashboard.
 `) + "\n"
 }

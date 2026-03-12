@@ -36,7 +36,7 @@ func Fetch(profile, token string) (Snapshot, error) {
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("User-Agent", "codex-usage-multi")
 
-	client := &http.Client{Timeout: 15 * time.Second}
+	client := &http.Client{Timeout: 5 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
 		return Snapshot{}, err
